@@ -26,6 +26,7 @@ class ControlPanelLocalizationTests(unittest.TestCase):
         script = localization_script()
         self.assertIn('"Overview":"概览"', script)
         self.assertIn("locale !== 'en' && locale !== 'zh-CN'", script)
+        self.assertIn("parts.leading + translated + parts.trailing", script)
 
 
 if __name__ == "__main__":

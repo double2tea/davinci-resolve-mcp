@@ -687,7 +687,7 @@ _LOCALIZATION_SCRIPT = r"""
       if (!parts || !parts.core) return;
       const translated = translateControlPanelValue(parts.core);
       if (translated === parts.core) return;
-      const localized = translated;
+      const localized = parts.leading + translated + parts.trailing;
       CONTROL_PANEL_TEXT_ORIGINALS.set(node, { english: current, localized });
       node.data = localized;
     }

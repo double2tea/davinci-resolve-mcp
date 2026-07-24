@@ -3972,6 +3972,12 @@ HTML = r"""<!doctype html>
       .settings-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 620px) {
+      main { padding-bottom: var(--space-3); }
+      .lab-footer {
+        position: static;
+        height: auto;
+        min-height: 112px;
+      }
       .overview-grid { grid-template-columns: 1fr; }
       .nav-left { flex: 0 0 auto; }
       .wordmark span:first-child { display: none; }

@@ -4111,9 +4111,14 @@ def _transcribe_with_http_provider(
             "error": "HTTP transcription response must be a JSON object.",
         }
     response_field = provider.get("response_field")
-    raw_transcript = response_payload.get(response_field) if response_field else response_payload
-    if raw_transcript is None:
-        raw_transcript = response_payload
+    if response_field and response_field not in response_payload:
+        return {
+            "success": False,
+            "backend": backend,
+            "provider": provider["label"],
+            "error": f"HTTP transcription response did not include '{response_field}'.",
+        }
+    raw_transcript = response_payload[response_field] if response_field else response_payload
     if isinstance(raw_transcript, str):
         try:
             raw = json.loads(raw_transcript)

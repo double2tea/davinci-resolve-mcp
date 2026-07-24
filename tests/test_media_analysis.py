@@ -831,6 +831,30 @@ class MediaAnalysisPlanningTests(unittest.TestCase):
         self.assertFalse(request_payload["allow_download"])
         self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
 
+    @unittest.mock.patch("src.utils.media_analysis.urllib.request.urlopen")
+    def test_http_provider_rejects_missing_response_field(self, urlopen):
+        response = unittest.mock.MagicMock()
+        response.read.return_value = json.dumps({"error": "not ready"}).encode("utf-8")
+        urlopen.return_value.__enter__.return_value = response
+        provider = {
+            "id": "studio-asr",
+            "label": "Studio ASR",
+            "base_url": "https://asr.example.test",
+            "transcribe_path": "/stt",
+            "response_field": "result",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = _transcribe_with_http_provider(
+                "/tmp/source.wav",
+                {"analysis_json": os.path.join(tmp, "analysis.json")},
+                {},
+                provider,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "HTTP transcription response did not include 'result'.")
+
     def test_request_capabilities_report_host_chat_paths_vision(self):
         with tempfile.TemporaryDirectory() as tmp:
             previous = os.environ.get("DAVINCI_RESOLVE_MCP_MEDIA_ANALYSIS_PREFS")
