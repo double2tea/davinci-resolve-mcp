@@ -366,7 +366,7 @@ Workflow:
    Reuse existing evidence only when it already satisfies the requested technical, visual, transcription, and marker/writeback needs; otherwise run fresh analysis.
 6. Execute analysis by default. Use dry_run=true only when the user asks for a preview or when you are intentionally staging a very large batch before a slice-based job.
 7. Persist inspectable reports and artifacts by default under davinci-resolve-mcp-analysis. Use session_only=true only when the user explicitly asks for scratch results.
-8. Visual analysis and transcription default on. If include_visuals is true, request vision={{"enabled": true, "provider": "host_chat_paths"}}. The analyze tool will respond with a deferred payload containing absolute frame_paths and a JSON schema; read each frame as a local image, produce JSON per the schema, then call media_analysis(action="commit_vision", params={{"clip_id": "...", "visual": <your JSON>, "vision_token": "..."}}) per clip. Metadata writeback and Media Pool clip markers publish automatically when commit_vision finalizes each clip. If include_transcription is true, request transcription={{"enabled": true, "allow_model_download": true}} so the configured local transcription backend can run.
+8. Visual analysis and transcription default on. If include_visuals is true, request vision={{"enabled": true, "provider": "host_chat_paths"}}. The analyze tool will respond with a deferred payload containing absolute frame_paths and a JSON schema; read each frame as a local image, produce JSON per the schema, then call media_analysis(action="commit_vision", params={{"clip_id": "...", "visual": <your JSON>, "vision_token": "..."}}) per clip. Metadata writeback and Media Pool clip markers publish automatically when commit_vision finalizes each clip. If include_transcription is true, request transcription={{"enabled": true, "allow_model_download": false}}. Set allow_model_download=true only after the user explicitly approves a missing model download.
 9. If you cannot read the frame_paths as images, the visual layer remains pending_host_vision_analysis — surface that to the user; do not call the analysis complete unless they explicitly opt out with include_visuals=false.
 10. Executed Resolve-target analysis writes metadata and source-time Media Pool clip markers by default after commit_vision finalizes. Pass publish_metadata=false, timed_markers="no", or dry_run=true only when the user asks to avoid Resolve project writeback.
 11. If the task is about an existing edit, markers, or a finished video, call media_analysis(action="review_timeline_markers", params={{"vision": {{"enabled": {str(include_visuals).lower()}, "provider": "host_chat_paths"}}}}) when marker/frame alignment affects the decision. The response will include image_path; read it and answer inline (no commit step).
@@ -386,7 +386,7 @@ Recommended execution params:
   "search_related_project_roots": true,
   "max_analysis_frames": 8,
   "vision": {{"enabled": {str(include_visuals).lower()}, "provider": "host_chat_paths"}},
-  "transcription": {{"enabled": {str(include_transcription).lower()}, "allow_model_download": true}}
+  "transcription": {{"enabled": {str(include_transcription).lower()}, "allow_model_download": false}}
 }}
 
 Interpretation rules learned from live Resolve sessions:
@@ -9905,7 +9905,7 @@ def _media_analysis_vision_options(enabled: bool) -> Dict[str, Any]:
 def _media_analysis_transcription_options(enabled: bool) -> Dict[str, Any]:
     options = {"enabled": bool(enabled)}
     if enabled:
-        options["allow_model_download"] = True
+        options["allow_model_download"] = False
     return options
 
 
