@@ -11,11 +11,13 @@ Usage:
     python src/server.py --full       # Start the 341-tool granular server instead
 """
 
-VERSION = "2.65.0"
+VERSION = "2.68.2"
 
 import base64
 import os
 import sys
+import functools
+import inspect
 import json
 import logging
 import math
@@ -49,6 +51,11 @@ from src.utils.cut_ir import build_cut_list as _build_cut_list
 from src.utils.page_lock import open_page_serialized as _open_page_serialized
 from src.utils.proc import safe_run
 from src.utils.readback import verify_by_readback, verification_stats as _verification_stats
+from src.utils.render_ids import (
+    render_codec_id_from_codecs as _render_codec_id_from_codecs,
+    render_format_id_from_formats as _render_format_id_from_formats,
+)
+from src.utils import delivery_targets as _delivery_targets
 from src.utils.update_check import (
     check_for_updates,
     clear_update_prompt_preferences,
@@ -117,6 +124,7 @@ from src.utils.fusion_group_settings import (
 from src.utils import analysis_runs as _analysis_runs
 from src.utils import brain_edits as _brain_edits
 from src.utils import edit_engine as _edit_engine_mod
+from src.utils import transcript_edit as _transcript_edit_defaults
 from src.utils import media_pool_changes as _media_pool_changes
 from src.utils import timeline_versioning as _timeline_versioning
 from src.utils import project_spec as _project_spec
@@ -288,7 +296,7 @@ def davinci_resolve_workflow() -> str:
     return """Use this DaVinci Resolve MCP server as a guarded post-production control surface.
 
 Core pattern:
-- Prefer the 32 compound tools and their action names over raw scripting.
+- Prefer the 34 compound tools and their action names over raw scripting.
 - Start by probing state: resolve_control.get_version/get_page, project_manager.get_current, timeline.get_current, and media_pool.probe_media_pool.
 - Before mutating timelines, media pools, render settings, grades, projects, databases, or extensions, prefer the matching probe, capabilities, boundary_report, safe_*, or dry_run action when one exists.
 - Preserve source media integrity. Never transcode, proxy, rewrite, move, rename, or create derivatives of source media unless the user explicitly asks. Analysis output belongs in sidecars or analysis directories.
@@ -798,11 +806,32 @@ def _is_resolve_handle_live(candidate) -> bool:
         return False
 
 
+def _bridge_requested() -> bool:
+    """Has the operator asked for the in-app bridge?
+
+    Read at call time rather than at import, so a server started before the
+    variable was set still honours it.
+    """
+    try:
+        from src.utils import resolve_bridge_client
+
+        return resolve_bridge_client.bridge_enabled()
+    except Exception:  # pragma: no cover - the client is optional
+        return False
+
+
 def _try_connect():
     """Attempt to connect to Resolve once. Returns resolve object or None."""
     global resolve
     with _resolve_lock:
-        if dvr_script is None:
+        # `dvr_script` is Blackmagic's module, and it ships with the *installer*,
+        # not the App Store build — a free-edition-only machine has no
+        # Developer/Scripting/Modules tree at all, so the import fails. Bailing
+        # here made the bridge unreachable on precisely the configuration it
+        # exists for: `connect_resolve` accepts None in bridge mode, and this
+        # returned before ever calling it. Verified by blocking the import with a
+        # healthy bridge listening — get_resolve() answered None.
+        if dvr_script is None and not _bridge_requested():
             return None
         try:
             candidate = connect_resolve(dvr_script)
@@ -817,13 +846,34 @@ def _try_connect():
             resolve = None
             return None
 
+#: macOS puts the two editions in different places, and only the first was ever
+#: checked — so an auto-launch on a machine with both would start Studio even
+#: when the free edition was the one in use. Ordered installer-first to keep the
+#: previous behaviour where Studio is present.
+_MACOS_RESOLVE_APPS = (
+    "/Applications/DaVinci Resolve/DaVinci Resolve.app",  # installer / Studio
+    "/Applications/DaVinci Resolve.app",                  # App Store, free
+)
+
+
 def _launch_resolve():
     """Launch DaVinci Resolve and wait for it to become available."""
+    if _bridge_requested():
+        # Launching cannot produce a bridge. The listener only exists once
+        # someone runs Workspace > Scripts > resolve_bridge inside an already
+        # running Resolve, so starting the application here would open a window
+        # nobody asked for and still fail to connect.
+        logger.error(
+            "The in-app bridge is enabled but not answering. Start it from "
+            "Workspace > Scripts > resolve_bridge inside the running Resolve; "
+            "launching the application cannot start it."
+        )
+        return False
     sys_name = platform.system().lower()
     if sys_name == "darwin":
-        app_path = "/Applications/DaVinci Resolve/DaVinci Resolve.app"
-        if not os.path.exists(app_path):
-            logger.error(f"DaVinci Resolve not found at {app_path}")
+        app_path = next((p for p in _MACOS_RESOLVE_APPS if os.path.exists(p)), None)
+        if app_path is None:
+            logger.error("DaVinci Resolve not found in %s", list(_MACOS_RESOLVE_APPS))
             return False
         subprocess.Popen(["open", app_path], stdin=subprocess.DEVNULL)
     elif sys_name == "windows":
@@ -849,6 +899,37 @@ def _launch_resolve():
     logger.warning("Resolve did not respond within 60s after launch")
     return False
 
+#: Process names that mean a DaVinci Resolve application is already running.
+#: Deliberately not the full path: the App Store build lives at
+#: `/Applications/DaVinci Resolve.app` and the installer build inside
+#: `/Applications/DaVinci Resolve/`, and either one counts.
+_RESOLVE_PROCESS_PATTERNS = (
+    "DaVinci Resolve.app/Contents/MacOS/Resolve",   # macOS, both editions
+    "Resolve.exe",                                  # Windows
+    "/opt/resolve/bin/resolve",                     # Linux
+)
+
+
+def resolve_is_running() -> Optional[bool]:
+    """Is a Resolve application already up? None when it cannot be determined.
+
+    Best-effort and dependency-free. `None` rather than `False` on failure, so an
+    unanswerable question never silently becomes "nothing is running" — which is
+    the answer that leads to launching something.
+    """
+    try:
+        if platform.system().lower() == "windows":
+            out = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=10, check=False)
+        else:
+            out = subprocess.run(["ps", "-Ao", "command="], capture_output=True, text=True, timeout=10, check=False)
+        if out.returncode != 0 and not out.stdout:
+            return None
+        listing = out.stdout or ""
+    except Exception:  # pragma: no cover - defensive; an unknown answer is None
+        return None
+    return any(pattern in listing for pattern in _RESOLVE_PROCESS_PATTERNS)
+
+
 def get_resolve():
     """Lazy connection to Resolve — connects on first tool call, auto-launches if needed."""
     global resolve
@@ -859,10 +940,82 @@ def get_resolve():
         # Try to connect to an already-running Resolve.
         if _try_connect():
             return resolve
-        # Not running — launch it automatically.
+        # Failing to connect is NOT the same as nothing running, and conflating
+        # them opened an application nobody asked for. The free edition refuses
+        # external scripting by design, so on a machine where only it is running
+        # `_try_connect` always fails — and this then launched *Studio*, a second,
+        # different application, on every tool call. Reported three times before
+        # it was traced.
+        already_running = resolve_is_running()
+        if already_running:
+            logger.error(
+                "DaVinci Resolve is already running but is not answering the scripting API, "
+                "so it will NOT be launched again. Either enable Preferences > General > "
+                "'External scripting using' = Local (Studio only), or, on the free edition, "
+                "use the in-app bridge: install it, run Workspace > Scripts > resolve_bridge, "
+                "and set DAVINCI_RESOLVE_BRIDGE=1."
+            )
+            return None
+        if already_running is None:
+            logger.warning("Could not determine whether Resolve is running; not launching it.")
+            return None
         logger.info("Resolve not running, attempting to launch automatically...")
         _launch_resolve()
         return resolve
+
+
+def _not_connected_error():
+    """The caller-facing "no Resolve" error, describing what is actually the case.
+
+    Eleven call sites used to assert that Resolve was not running, that starting it
+    had been tried and failed, and that the reader should check their Studio
+    install. Once `get_resolve` stopped launching a second application, all three
+    claims were wrong: nothing was launched, Resolve *is* running, and a
+    free-edition user was being sent to check an install they may not have. The
+    accurate guidance was only reaching the log.
+
+    So the message is derived from the situation instead of asserted, and it names
+    the fix that applies: enable external scripting on Studio, or use the in-app
+    bridge on the free edition.
+    """
+    running = resolve_is_running()
+    bridge_on = _bridge_requested()
+    if bridge_on:
+        return _err(
+            "The in-app bridge is enabled but not answering.",
+            code="BRIDGE_UNAVAILABLE", category="not_connected",
+            # `not_connected` defaults to retryable because auto-launch may
+            # succeed next time. Nothing here will: the listener only appears once
+            # someone runs the script inside Resolve, so an agent retrying on a
+            # loop it cannot win is strictly worse than being told to stop.
+            retryable=False,
+            reason="DAVINCI_RESOLVE_BRIDGE is set, so no other transport is tried.",
+            remediation="In Resolve, run Workspace > Scripts > resolve_bridge. If it is not in "
+                        "that menu, run `python scripts/install_resolve_bridge.py` and restart "
+                        "Resolve; a framework Python from python.org is required for Resolve to "
+                        "list .py scripts at all.",
+            state={"resolve_running": running, "bridge_enabled": True},
+        )
+    if running:
+        return _err(
+            "DaVinci Resolve is running but is not answering the scripting API.",
+            code="SCRIPTING_UNAVAILABLE", category="not_connected",
+            # Not retryable: a preference has to change, or the bridge has to be
+            # started. Retrying the same call cannot make either happen.
+            retryable=False,
+            reason="External scripting is a Studio feature; the free edition refuses it "
+                   "regardless of the preference. Resolve was NOT launched again.",
+            remediation="On Studio: Preferences > General > 'External scripting using' = Local. "
+                        "On the free edition: install the in-app bridge, run "
+                        "Workspace > Scripts > resolve_bridge, and set DAVINCI_RESOLVE_BRIDGE=1.",
+            state={"resolve_running": True, "bridge_enabled": False},
+        )
+    return _err(
+        "DaVinci Resolve is not running and could not be started.",
+        code="RESOLVE_NOT_RUNNING", category="not_connected",
+        remediation="Start DaVinci Resolve and open a project, then retry.",
+        state={"resolve_running": bool(running), "bridge_enabled": False},
+    )
 
 
 def _destructive_versioning_provider() -> Optional[Tuple[Any, Any, str, Optional[str]]]:
@@ -1175,6 +1328,120 @@ _CATEGORY_RETRYABLE_DEFAULT: Dict[str, bool] = {
 
 # Sentinel so `retryable=None` from a caller is distinguishable from "unspecified".
 _RETRYABLE_UNSET = object()
+
+
+class _MissingParam(KeyError):
+    """A tool action subscripted a parameter the caller did not supply.
+
+    Subclasses `KeyError` so any existing `except KeyError` in the codebase keeps
+    behaving as it did; what it adds is the ability to tell a *missing argument*
+    apart from a KeyError on some other dict — a Resolve settings map, a parsed
+    JSON body — which would otherwise be reported to the caller as "you forgot an
+    argument" when the real fault is ours.
+    """
+
+
+class _Params(dict):
+    """The params dict, wired so a missing key is a diagnosable refusal.
+
+    Actions have historically reached into `p["track_type"]` directly. When the
+    key is absent that raises a bare `KeyError`, which escapes the action, escapes
+    the tool, and reaches the client as
+    `ToolError: Error executing tool timeline: 'track_type'` — no code, no
+    category, no remediation, and nothing an agent can route on. Measured across
+    the whole surface: **99 of 512 declared actions** failed that way.
+
+    Two ways to fix that were available. Rewriting all 99 sites to use
+    `contracts.validate` gives the best individual errors but is 99 chances to get
+    a spec wrong, and leaves the 100th site to be written next month. Catching
+    `KeyError` at the tool boundary closes the class in one place but cannot tell
+    which dict raised, so an unrelated internal KeyError would be mislabelled as
+    the caller's mistake.
+
+    This is the third option: keep the boundary catch, but make the *parameters*
+    raise something only they can raise. False positives become impossible by
+    construction.
+
+    `contracts.validate` remains the better tool wherever a type, a range or an
+    enum also needs checking, and the actions that already use it keep doing so.
+    This is deliberately **not** a migration of the 99 — rewriting them would add
+    99 opportunities to write a spec wrong without improving the defect being
+    fixed here, and it would still leave the next new action unguarded. What is
+    lost by not migrating is bounded: a *wrong* value still reaches Resolve, which
+    answers None or False, so the result is a truthful failure rather than a
+    misleading success.
+    """
+
+    def __missing__(self, key):
+        raise _MissingParam(key)
+
+
+def _params(params: Optional[Dict[str, Any]]) -> "_Params":
+    """Every tool body starts here, so every action gets the diagnosable dict.
+
+    Note `_Params(params or {})` rather than a truthiness dance: an empty
+    `_Params` is falsy like any empty dict, so `p = params or {}` would have
+    quietly handed back a *plain* dict in exactly the no-arguments case this
+    exists to serve.
+    """
+    return _Params(params or {})
+
+
+def _missing_param_error(exc: _MissingParam, action: str) -> Dict[str, Any]:
+    """Turn a missing parameter into the envelope the rest of the surface uses."""
+    name = exc.args[0] if exc.args else "parameter"
+    slug = re.sub(r"[^A-Z0-9]+", "_", str(name).upper()).strip("_") or "PARAMETER"
+    return _err(
+        f"'{name}' is required",
+        code=f"MISSING_{slug}",
+        category="invalid_input",
+        remediation=f"pass {name} in params, e.g. params={{\"{name}\": ...}}",
+        state={"action": action, "missing": str(name)},
+    )
+
+
+def _guarded_action_name(args, kwargs) -> str:
+    """The `action` this call was for, wherever it was passed."""
+    if "action" in kwargs:
+        return str(kwargs["action"])
+    return str(args[0]) if args else "?"
+
+
+def _guard_missing_params(fn):
+    """Tool decorator: report a missing parameter instead of leaking a KeyError.
+
+    Sits *under* `@mcp.tool()` so FastMCP registers the guarded callable.
+    `functools.wraps` keeps the name, docstring and signature FastMCP builds the
+    tool schema from.
+
+    Two things this has to preserve, both learned by breaking them:
+
+    - **Async tools must stay coroutine functions.** `media_analysis` is `async`,
+      and a synchronous wrapper around it returned an un-awaited coroutine that
+      FastMCP could not use — the tool stopped answering entirely, taking its 71
+      actions with it. `inspect.iscoroutinefunction` decides which wrapper to
+      build, and a test now pins that async tools are still async afterwards.
+    - **The signature is not (action, params).** `media_analysis` also takes
+      `ctx: Optional[Context]`, so the wrapper forwards `*args, **kwargs` rather
+      than naming parameters it does not know about.
+    """
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except _MissingParam as exc:
+                return _missing_param_error(exc, _guarded_action_name(args, kwargs))
+    else:
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except _MissingParam as exc:
+                return _missing_param_error(exc, _guarded_action_name(args, kwargs))
+
+    wrapper.__wrapped_by_missing_param_guard__ = True
+    return wrapper
 
 
 def _err(message, *, code=None, category=None, retryable=_RETRYABLE_UNSET,
@@ -12639,6 +12906,7 @@ def _setup_clear_defaults(keys: Any, dry_run: bool) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_guard_missing_params
 def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Configure MCP conversational defaults and setup preferences.
 
@@ -12652,7 +12920,7 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
       media_analysis.*: analysis, metadata, marker, reporting, and workflow defaults
       updates.*: MCP update policy, interval, and snooze defaults
     """
-    p = params or {}
+    p = _params(params)
     if action in {"schema", "capabilities", "options"}:
         return {
             "actions": ["schema", "get_defaults", "set_defaults", "clear_defaults"],
@@ -12792,6 +13060,7 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
 
 
 @mcp.tool()
+@_guard_missing_params
 def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """App-level DaVinci Resolve operations.
 
@@ -12834,7 +13103,7 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
       restore_state(state_token) -> {success, restored: {...}}
         — Returns Resolve to a previously-saved state.
     """
-    p = params or {}
+    p = _params(params)
 
     # api_truth is a static knowledge lookup — no Resolve connection needed.
     if action == "api_truth":
@@ -12899,11 +13168,11 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         r = get_resolve()  # auto-launches if not running
         if r is not None:
             return _ok(message="DaVinci Resolve is running and connected.")
-        return _err("Could not connect to DaVinci Resolve. Check that Resolve Studio is installed and 'External scripting using' is set to Local in Preferences.")
+        return _not_connected_error()
 
     r = get_resolve()  # auto-launches if not running
     if r is None:
-        return _err("Could not connect to DaVinci Resolve after auto-launch attempt. Check that Resolve Studio is installed.")
+        return _not_connected_error()
 
     if action == "get_version":
         update_env = _setup_update_env()
@@ -13811,6 +14080,7 @@ def _close_control_panel() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def layout_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Manage DaVinci Resolve UI layout presets.
 
@@ -13822,10 +14092,10 @@ def layout_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
       import_preset(path, name?) -> {success}
       delete(name) -> {success}
     """
-    p = params or {}
+    p = _params(params)
     r = get_resolve()
     if r is None:
-        return _err("Could not connect to DaVinci Resolve. It was not running and auto-launch failed. Check that Resolve Studio is installed.")
+        return _not_connected_error()
 
     if action == "save":
         if not p.get("name"):
@@ -13857,6 +14127,7 @@ def layout_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def render_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Import/export render and burn-in presets.
 
@@ -13866,10 +14137,10 @@ def render_presets(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
       import_burnin(path) -> {success}
       export_burnin(name, path) -> {success}
     """
-    p = params or {}
+    p = _params(params)
     r = get_resolve()
     if r is None:
-        return _err("Could not connect to DaVinci Resolve. It was not running and auto-launch failed. Check that Resolve Studio is installed.")
+        return _not_connected_error()
 
     if action == "import_render":
         return {"success": bool(r.ImportRenderPreset(p["path"]))}
@@ -14767,6 +15038,7 @@ def _project_lint_live(r, pm) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_guard_missing_params
 def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Manage DaVinci Resolve projects.
 
@@ -14808,10 +15080,10 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         settings are applied in dependency order; markers only added if absent. Hooks run only
         when run_hooks=true (executes shell from the spec — opt-in).
     """
-    p = params or {}
+    p = _params(params)
     r = get_resolve()
     if r is None:
-        return _err("Could not connect to DaVinci Resolve. It was not running and auto-launch failed. Check that Resolve Studio is installed.")
+        return _not_connected_error()
     pm = r.GetProjectManager()
 
     if action == "lint":
@@ -14915,6 +15187,7 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def project_manager_folders(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Navigate and manage project folders in the Project Manager.
 
@@ -14927,10 +15200,10 @@ def project_manager_folders(action: str, params: Optional[Dict[str, Any]] = None
       goto_root() -> {success}
       goto_parent() -> {success}
     """
-    p = params or {}
+    p = _params(params)
     r = get_resolve()
     if r is None:
-        return _err("Could not connect to DaVinci Resolve. It was not running and auto-launch failed. Check that Resolve Studio is installed.")
+        return _not_connected_error()
     pm = r.GetProjectManager()
 
     if action == "list":
@@ -14959,6 +15232,7 @@ def project_manager_folders(action: str, params: Optional[Dict[str, Any]] = None
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def project_manager_cloud(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Cloud project operations (requires DaVinci Resolve cloud infrastructure).
 
@@ -14968,10 +15242,10 @@ def project_manager_cloud(action: str, params: Optional[Dict[str, Any]] = None) 
       import_project(path, settings) -> {success}
       restore(folder_path, settings) -> {success}
     """
-    p = params or {}
+    p = _params(params)
     r = get_resolve()
     if r is None:
-        return _err("Could not connect to DaVinci Resolve. It was not running and auto-launch failed. Check that Resolve Studio is installed.")
+        return _not_connected_error()
     pm = r.GetProjectManager()
 
     # cloudSettings is enum-keyed (CLOUD_SETTING_*/CLOUD_SYNC_*); resolve string
@@ -14997,6 +15271,7 @@ def project_manager_cloud(action: str, params: Optional[Dict[str, Any]] = None) 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def project_manager_database(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Manage DaVinci Resolve project databases.
 
@@ -15005,10 +15280,10 @@ def project_manager_database(action: str, params: Optional[Dict[str, Any]] = Non
       list() -> {databases}
       set_current(db_info) -> {success}  — db_info: {DbType, DbName}
     """
-    p = params or {}
+    p = _params(params)
     r = get_resolve()
     if r is None:
-        return _err("Could not connect to DaVinci Resolve. It was not running and auto-launch failed. Check that Resolve Studio is installed.")
+        return _not_connected_error()
     pm = r.GetProjectManager()
 
     if action == "get_current":
@@ -15028,6 +15303,7 @@ def project_manager_database(action: str, params: Optional[Dict[str, Any]] = Non
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def project_settings(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Project metadata, settings, and color groups.
 
@@ -15052,7 +15328,7 @@ def project_settings(action: str, params: Optional[Dict[str, Any]] = None) -> Di
       apply_fairlight_preset(preset_name) -> {success}
       generate_speech(speech_generation_settings, timecode?) -> {success, new, new_id}  — Resolve 21+, AI Speech Generator; creates new audio media (confirm-gated)
     """
-    p = params or {}
+    p = _params(params)
     _, proj, err = _check()
     if err:
         return err
@@ -15233,6 +15509,10 @@ _RENDER_KERNEL_ACTIONS = [
     "quick_export_capabilities",
     "safe_quick_export",
     "export_render_boundary_report",
+    "list_delivery_targets",
+    "resolve_delivery_target",
+    "list_loudness_standards",
+    "prepare_delivery_job",
 ]
 
 
@@ -15256,24 +15536,6 @@ def _render_formats(proj):
     return _ser(formats)
 
 
-def _render_format_id_from_formats(formats: Any, fmt: str) -> str:
-    if not isinstance(fmt, str) or not fmt or not isinstance(formats, dict):
-        return fmt
-    if fmt in formats:
-        return formats.get(fmt) or fmt
-    if fmt in formats.values():
-        return fmt
-    needle = fmt.lower()
-    for label, format_id in formats.items():
-        label_text = str(label)
-        id_text = str(format_id)
-        if label_text.lower() == needle:
-            return id_text or fmt
-        if id_text.lower() == needle:
-            return id_text
-    return fmt
-
-
 def _render_format_id(proj, fmt: str, formats: Optional[Dict[str, Any]] = None) -> str:
     if formats is None:
         formats = _render_formats(proj)
@@ -15292,6 +15554,15 @@ def _render_format_requested(requested: Optional[List[Any]], label: str, extensi
         if isinstance(item, str) and item.lower() in {label.lower(), extension_text.lower(), format_id.lower()}:
             return True
     return False
+
+
+def _render_codec_id(proj, fmt: str, codec: str, formats: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve a codec display name to its id for `fmt` (itself label-or-id tolerant)."""
+    try:
+        codecs = proj.GetRenderCodecs(_render_format_id(proj, fmt, formats)) or {}
+    except Exception:
+        return codec
+    return _render_codec_id_from_codecs(codecs, codec)
 
 
 def _render_codecs(proj, fmt: str, formats: Optional[Dict[str, Any]] = None):
@@ -15490,7 +15761,33 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
     before = _render_settings_snapshot(proj)
     format_success = None
     if p.get("format") and p.get("codec"):
-        format_success = bool(proj.SetCurrentRenderFormatAndCodec(_render_format_id(proj, p["format"]), p["codec"]))
+        formats = _render_formats(proj)
+        format_id = _render_format_id_from_formats(formats, p["format"])
+        codec_id = _render_codec_id(proj, format_id, p["codec"], formats)
+        format_success = bool(proj.SetCurrentRenderFormatAndCodec(format_id, codec_id))
+        if not format_success:
+            # Refuse to queue. Continuing here would apply settings, return a real
+            # job id, and report success=True for a job that renders in the
+            # PREVIOUSLY set format/codec — with format_success=False the only
+            # signal, buried in the payload.
+            return _err(
+                f"Could not set render format/codec: {p['format']} / {p['codec']}",
+                code="RENDER_FORMAT_CODEC_REJECTED",
+                category="invalid_input",
+                reason="Resolve rejected the format/codec pair; no render job was queued.",
+                remediation=(
+                    "Check render(action='get_formats') and "
+                    "render(action='get_codecs', params={'format': ...}) for what this "
+                    "machine, license, and plugin set actually support."
+                ),
+                state={
+                    "requested_format": p["format"],
+                    "requested_codec": p["codec"],
+                    "resolved_format_id": format_id,
+                    "resolved_codec_id": codec_id,
+                    "available_codecs": _render_codecs(proj, format_id, formats),
+                },
+            )
     settings_success = bool(proj.SetRenderSettings(settings))
     job_id = proj.AddRenderJob() if settings_success else None
     return {
@@ -15501,6 +15798,217 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         "before": before,
         "settings": settings,
     }
+
+
+# ── Delivery targets ────────────────────────────────────────────────────────
+# Named render intents. One definition emits both the Resolve render settings
+# and the ffprobe-shaped QC spec, so the advanced server can verify a rendered
+# file against the same intent that produced it. See src/utils/delivery_targets.py.
+
+
+def _delivery_target_extras() -> Dict[str, Any]:
+    """User-defined targets from logs/delivery-targets.json; {} if absent/broken."""
+    try:
+        return _delivery_targets.load_user_targets(
+            _delivery_targets.user_targets_path(project_dir)
+        )
+    except Exception as exc:  # pragma: no cover - defensive; loader already tolerates
+        logger.warning("could not load user delivery targets: %s", exc)
+        return {}
+
+
+def _delivery_timeline_fps(proj) -> Optional[float]:
+    """Timeline frame rate for targets that inherit it. None when unavailable.
+
+    Distinct from `_timeline_fps(tl)` above, which takes a timeline and returns a
+    (fps, err) tuple for timecode math.
+    """
+    try:
+        timeline = proj.GetCurrentTimeline()
+        if not timeline:
+            return None
+        value = timeline.GetSetting("timelineFrameRate")
+        return float(value) if value else None
+    except Exception:
+        return None
+
+
+def _resolve_delivery_target_live(proj, p: Dict[str, Any]):
+    """Resolve a named target against the LIVE format/codec matrix.
+
+    Returns (payload, error). Availability is machine/license/plugin dependent,
+    so a target that cannot be satisfied here fails with the actual available
+    lists rather than handing Resolve a name it will reject.
+    """
+    name = p.get("target")
+    if not name:
+        return None, _err(
+            "target is required",
+            code="MISSING_TARGET",
+            category="invalid_input",
+            remediation="Call render(action='list_delivery_targets') to see the available names.",
+        )
+    extras = _delivery_target_extras()
+    target = _delivery_targets.resolve_target(name, p.get("overrides"), extra_targets=extras)
+    if target is None:
+        return None, _err(
+            f"Unknown delivery target: {name}",
+            code="UNKNOWN_DELIVERY_TARGET",
+            category="invalid_input",
+            remediation="Call render(action='list_delivery_targets') to see the available names.",
+            state={"known_targets": sorted(_delivery_targets.list_targets(extras))},
+        )
+
+    formats = _render_formats(proj)
+    format_id = _delivery_targets.select_available(target.format_candidates, formats)
+    if not format_id:
+        return None, _err(
+            f"Delivery target '{target.id}' needs a render format this machine does not expose",
+            code="DELIVERY_TARGET_FORMAT_UNAVAILABLE",
+            category="unsupported",
+            reason="Render format availability depends on the Resolve version, license, and installed IO plugins.",
+            remediation="Check render(action='get_formats'); a codec plugin may need installing, or Resolve restarting.",
+            state={"target": target.id, "tried": list(target.format_candidates), "available_formats": formats},
+        )
+
+    codecs = _render_codecs(proj, format_id, formats)
+    codec_id = _delivery_targets.select_available(target.codec_candidates, codecs)
+    if not codec_id:
+        return None, _err(
+            f"Delivery target '{target.id}' needs a codec this machine does not expose for {format_id}",
+            code="DELIVERY_TARGET_CODEC_UNAVAILABLE",
+            category="unsupported",
+            reason="Codec availability depends on the Resolve version, license, and installed IO plugins.",
+            remediation="Check render(action='get_codecs', params={'format': ...}); a codec plugin may need installing, or Resolve restarting.",
+            state={
+                "target": target.id,
+                "format_id": format_id,
+                "tried": list(target.codec_candidates),
+                "available_codecs": codecs,
+            },
+        )
+
+    fps = _delivery_timeline_fps(proj)
+    qc_spec = _delivery_targets.to_qc_spec(target, timeline_fps=fps)
+    # Loudness is a separate projection feeding advanced `loudness_qc`, not a
+    # deliverable_qc field — the mix sets programme loudness, not the render.
+    loudness = _delivery_targets.to_loudness_target(target)
+    return (
+        {
+            "target": target.id,
+            "label": target.label,
+            "tier": target.tier,
+            "format_id": format_id,
+            "codec_id": codec_id,
+            "timeline_fps": fps,
+            "settings": _delivery_targets.to_render_settings(target, timeline_fps=fps),
+            "qc_spec": qc_spec,
+            "qc_note": (
+                None
+                if qc_spec
+                else "This target renders an image sequence; deliverable_qc probes a single file, so it has no QC spec."
+            ),
+            "loudness_target": loudness,
+            "loudness_note": (
+                None
+                if loudness
+                else "This target pins no programme loudness. Name one with "
+                "overrides={'loudness_standard': ...}; see render(action='list_loudness_standards')."
+            ),
+            "notes": list(target.notes),
+        },
+        None,
+    )
+
+
+def _list_loudness_standards(proj, p: Dict[str, Any]):
+    """Named programme-loudness contracts, so an agent cites one rather than inventing numbers."""
+    return (
+        {
+            "standards": _delivery_targets.list_loudness_standards(),
+            "lra_advisory_lu": _delivery_targets.LRA_ADVISORY_LU,
+            "usage": (
+                "Attach with render(action='resolve_delivery_target', params={'target': ..., "
+                "'overrides': {'loudness_standard': '<id>'}}), then hand the returned "
+                "loudness_target.target to the advanced server's loudness_qc."
+            ),
+            "note": (
+                "Dialogue-gated standards emit no gradeable integrated value: loudness_qc "
+                "measures full-program loudness, so that figure travels in meta for a "
+                "dialogue-gated meter and only true peak is asserted."
+            ),
+        },
+        None,
+    )
+
+
+def _list_delivery_targets(proj, p: Dict[str, Any]):
+    tier = p.get("tier")
+    if tier is not None and tier not in _delivery_targets.TIERS:
+        return _err(
+            f"Unknown tier: {tier}",
+            code="UNKNOWN_DELIVERY_TIER",
+            category="invalid_input",
+            state={"known_tiers": list(_delivery_targets.TIERS)},
+        )
+    extras = _delivery_target_extras()
+    listing = _delivery_targets.list_targets(extras, tier=tier)
+
+    if p.get("check_availability"):
+        # Resolve every target against the live matrix so the caller sees what
+        # this machine/license can actually render, not just what ships.
+        formats = _render_formats(proj)
+        codec_cache: Dict[str, Any] = {}
+        for target_id, entry in listing.items():
+            target = _delivery_targets.resolve_target(target_id, extra_targets=extras)
+            format_id = _delivery_targets.select_available(target.format_candidates, formats)
+            entry["available"] = False
+            entry["format_id"] = format_id
+            entry["codec_id"] = None
+            if not format_id:
+                entry["unavailable_reason"] = "format not exposed by this Resolve install"
+                continue
+            if format_id not in codec_cache:
+                codec_cache[format_id] = _render_codecs(proj, format_id, formats)
+            codec_id = _delivery_targets.select_available(target.codec_candidates, codec_cache[format_id])
+            entry["codec_id"] = codec_id
+            if not codec_id:
+                entry["unavailable_reason"] = f"no matching codec for format '{format_id}'"
+                continue
+            entry["available"] = True
+
+    return _ok(
+        targets=listing,
+        schema_version=_delivery_targets.SCHEMA_VERSION,
+        tiers=list(_delivery_targets.TIERS),
+        availability_checked=bool(p.get("check_availability")),
+    )
+
+
+def _prepare_delivery_job(proj, p: Dict[str, Any]):
+    """Resolve a named target, then queue a render job for it.
+
+    Target settings are the base; anything in `settings` wins, so a caller can
+    pin TargetDir/CustomName (or override a dimension) without restating the target.
+    """
+    resolved, err = _resolve_delivery_target_live(proj, p)
+    if err:
+        return err
+    settings = dict(resolved["settings"])
+    settings.update(p.get("settings") or {})
+    prepared = _prepare_render_job(
+        proj,
+        {
+            **{k: v for k, v in p.items() if k not in ("target", "overrides", "settings")},
+            "settings": settings,
+            "format": resolved["format_id"],
+            "codec": resolved["codec_id"],
+        },
+    )
+    if isinstance(prepared, dict) and not prepared.get("error"):
+        prepared["delivery_target"] = resolved["target"]
+        prepared["qc_spec"] = resolved["qc_spec"]
+    return prepared
 
 
 def _render_job_lifecycle_probe(proj, p: Dict[str, Any]):
@@ -15573,6 +16081,7 @@ def _export_render_boundary_report(proj, p: Dict[str, Any]):
 
 
 @mcp.tool()
+@_guard_missing_params
 def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Render pipeline: jobs, presets, formats, codecs, and rendering.
 
@@ -15610,8 +16119,18 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
       quick_export_capabilities() -> {presets, safe_params, guards}
       safe_quick_export(preset, target_dir?|params?, custom_name?, dry_run?, allow_render?) -> {success, status}
       export_render_boundary_report(include_matrix?, max_pairs?, include_quick_export?) -> {capabilities, settings, matrix?}
+      list_delivery_targets(tier?, check_availability?) -> {targets, tiers, schema_version}
+      resolve_delivery_target(target, overrides?) -> {format_id, codec_id, settings, qc_spec}
+      prepare_delivery_job(target, target_dir, overrides?, settings?, custom_name?, dry_run?) -> {success, job_id, qc_spec}
+
+    Delivery targets are named render intents (`prores422hq_master`, `youtube`,
+    `tiktok`, ...). One definition emits both the Resolve render settings and an
+    ffprobe-shaped QC spec, so the advanced server's `deliverable_qc` can verify a
+    rendered file against the same intent that produced it. Format/codec are
+    resolved against the live matrix, so an intent unavailable on this
+    machine/license fails with the actual available lists.
     """
-    p = params or {}
+    p = _params(params)
     _, proj, err = _check()
     if err:
         return err
@@ -15644,14 +16163,51 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
         return {"codecs": _render_codecs(proj, p["format"])}
     elif action == "get_format_and_codec":
         return _ser(proj.GetCurrentRenderFormatAndCodec())
+    elif action == "list_delivery_targets":
+        return _list_delivery_targets(proj, p)
+    elif action == "resolve_delivery_target":
+        _resolved, _target_err = _resolve_delivery_target_live(proj, p)
+        return _target_err if _target_err else _ok(**_resolved)
+    elif action == "list_loudness_standards":
+        _standards, _standards_err = _list_loudness_standards(proj, p)
+        return _standards_err if _standards_err else _ok(**_standards)
+    elif action == "prepare_delivery_job":
+        return _prepare_delivery_job(proj, p)
     elif action == "set_format_and_codec":
-        return {"success": bool(proj.SetCurrentRenderFormatAndCodec(_render_format_id(proj, p["format"]), p["codec"]))}
+        _formats = _render_formats(proj)
+        _format_id = _render_format_id_from_formats(_formats, p["format"])
+        _codec_id = _render_codec_id(proj, _format_id, p["codec"], _formats)
+        if not proj.SetCurrentRenderFormatAndCodec(_format_id, _codec_id):
+            # Availability is machine/license/plugin dependent, so name what this
+            # install actually exposes instead of just reporting False.
+            return _err(
+                f"Could not set render format/codec: {p['format']} / {p['codec']}",
+                code="RENDER_FORMAT_CODEC_REJECTED",
+                category="invalid_input",
+                reason="Resolve rejected the format/codec pair.",
+                remediation=(
+                    "Check render(action='get_formats') and "
+                    "render(action='get_codecs', params={'format': ...}). If the codec comes "
+                    "from an IO plugin, confirm it is installed and Resolve has been restarted."
+                ),
+                state={
+                    "requested_format": p["format"],
+                    "requested_codec": p["codec"],
+                    "resolved_format_id": _format_id,
+                    "resolved_codec_id": _codec_id,
+                    "available_codecs": _render_codecs(proj, _format_id, _formats),
+                },
+            )
+        return {"success": True, "format_id": _format_id, "codec_id": _codec_id}
     elif action == "get_mode":
         return {"mode": proj.GetCurrentRenderMode()}
     elif action == "set_mode":
         return {"success": bool(proj.SetCurrentRenderMode(p["mode"]))}
     elif action == "get_resolutions":
-        return {"resolutions": _ser(proj.GetRenderResolutions(_render_format_id(proj, p["format"]), p["codec"]))}
+        _formats = _render_formats(proj)
+        _format_id = _render_format_id_from_formats(_formats, p["format"])
+        _codec_id = _render_codec_id(proj, _format_id, p["codec"], _formats)
+        return {"resolutions": _ser(proj.GetRenderResolutions(_format_id, _codec_id))}
     elif action == "get_settings":
         missing = _requires_method(proj, "GetRenderSettings", "unknown")
         if missing:
@@ -15717,6 +16273,7 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def media_storage(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Browse storage volumes and import media into the Media Pool.
 
@@ -15733,10 +16290,10 @@ def media_storage(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
       add_clip_mattes(clip_id, paths, stereo_eye?) -> {success}
       add_timeline_mattes(paths) -> {items}
     """
-    p = params or {}
+    p = _params(params)
     r = get_resolve()
     if r is None:
-        return _err("Could not connect to DaVinci Resolve. It was not running and auto-launch failed. Check that Resolve Studio is installed.")
+        return _not_connected_error()
     ms = r.GetMediaStorage()
 
     if action == "get_volumes":
@@ -15784,6 +16341,7 @@ def media_storage(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("media_pool")
 def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Manage the Media Pool: folders, clips, timelines, import/export.
@@ -15871,7 +16429,7 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
       copy_clip_annotations(source_clip_id, target_clip_ids, include_markers?, include_flags?, include_clip_color?, dry_run?) -> {success, results}
       media_pool_boundary_report(depth?, clip_ids?, selected?) -> {capabilities, media_pool, items?}
     """
-    p = params or {}
+    p = _params(params)
     _, proj, mp, err = _get_mp()
     if err:
         return err
@@ -16248,6 +16806,7 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def folder(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Operations on Media Pool folders.
 
@@ -16266,7 +16825,7 @@ def folder(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
       analyze_for_slate(path?, marker_color?) -> {success}  — Resolve 21+, AI Slate ID Extra
       remove_motion_blur(path?, deblur_option?) -> {success, created}  — Resolve 21+; renders NEW media (confirm-gated)
     """
-    p = params or {}
+    p = _params(params)
     _, _, mp, err = _get_mp()
     if err:
         return err
@@ -16389,6 +16948,7 @@ def folder(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Operations on a media pool clip. Identify clip by clip_id.
 
@@ -16440,7 +17000,7 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
           verified empirically on Resolve Studio 20.3.2.9. If BMD changes the
           behavior the clip will still be selected — editor double-clicks to load.
     """
-    p = params or {}
+    p = _params(params)
     _, _, mp, err = _get_mp()
     if err:
         return err
@@ -16753,6 +17313,7 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def media_pool_item_markers(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Markers and flags on media pool clips. Identify clip by clip_id.
 
@@ -16773,7 +17334,7 @@ def media_pool_item_markers(action: str, params: Optional[Dict[str, Any]] = None
       monitor_growing_file(clip_id) -> {success}
       replace_clip_preserve_sub_clip(clip_id, path) -> {success}
     """
-    p = params or {}
+    p = _params(params)
     _, _, mp, err = _get_mp()
     if err:
         return err
@@ -16885,6 +17446,7 @@ def _opt_number(value: Any) -> Optional[float]:
 
 
 @mcp.tool()
+@_guard_missing_params
 async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, ctx: Optional[Context] = None) -> Dict[str, Any]:
     """Project-scoped media analysis and guarded metadata publishing.
 
@@ -16981,7 +17543,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
     vision-dependent metadata to Resolve. Works with any MCP client whose chat
     model is vision-capable; no sampling/createMessage support required.
     """
-    p = _media_analysis_apply_setup_defaults(action, dict(params or {}))
+    p = _params(_media_analysis_apply_setup_defaults(action, dict(params or {})))
 
     # First-run frame-sampling prompt: if the user has never chosen a sampling
     # mode (and didn't pass one this call), ask before spending any vision
@@ -17039,6 +17601,38 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
 
     if action == "capabilities":
         return _media_analysis_capabilities_for_request(ctx)
+    if action == "assess_grade":
+        # Numeric grade-damage QC. Distinct from advanced `verify_grade`, which
+        # asks whether Resolve applied what was asked; this asks whether the
+        # resulting image is damaged. Free and deterministic — the vision block
+        # in the result says whether a paid second opinion is warranted.
+        from src.utils import image_qc as _image_qc_mod
+
+        try:
+            return _ok(**_image_qc_mod.assess_grade(
+                str(p.get("source_path") or p.get("sourcePath") or ""),
+                time_seconds=float(p.get("time_seconds", p.get("timeSeconds", 0.0)) or 0.0),
+                graded_path=(p.get("graded_path") or p.get("gradedPath")) or None,
+                lut_path=(p.get("lut_path") or p.get("lutPath")) or None,
+                working_space=str(p.get("working_space") or p.get("workingSpace") or "rec709"),
+                cost_tier=str(p.get("cost_tier") or p.get("costTier") or _image_qc_mod.DEFAULT_COST_TIER),
+            ))
+        except _image_qc_mod.ImageQcError as exc:
+            return _err(
+                str(exc),
+                code="IMAGE_QC_REFUSED",
+                category="invalid_input",
+                remediation=(
+                    "Supply exactly one of graded_path or lut_path, and declare a display-referred "
+                    "working_space. Log/scene-referred frames must be converted first — these "
+                    "metrics are undefined on them and will not be guessed at."
+                ),
+            )
+    if action == "image_qc_capabilities":
+        from src.utils import image_qc as _image_qc_mod
+
+        return _ok(**_image_qc_mod.capabilities(), cost_tiers=list(_image_qc_mod.COST_TIERS),
+                   default_cost_tier=_image_qc_mod.DEFAULT_COST_TIER)
     if action == "recheck_capabilities":
         # Re-runs detection (shutil.which / importlib.util.find_spec) so a tool
         # an agent just installed flips from missing → available without the
@@ -17948,6 +18542,8 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
     return _unknown(action, [
         "capabilities",
         "recheck_capabilities",
+        "assess_grade",
+        "image_qc_capabilities",
         "install_guidance",
         "resolve_output_root",
         "plan",
@@ -18023,6 +18619,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def timeline_versioning(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Timeline version-on-mutate, archive, rollback, and brain-edit history (C6).
 
@@ -18070,7 +18667,7 @@ def timeline_versioning(action: str, params: Optional[Dict[str, Any]] = None) ->
     if ctx is None:
         return _err("No current project / can't resolve project root")
     resolve_h, project_h, project_root, project_name = ctx
-    p = params or {}
+    p = _params(params)
 
     if action == "begin_run":
         return _analysis_runs.begin_run(
@@ -18395,6 +18992,7 @@ def _edit_engine_linked_audio_tracks(
 
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("edit_engine")
 def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Evidence-driven edit loops (Phase E): selects assembly, tighten, swap.
@@ -18436,7 +19034,7 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       timeline (version-archived first).
     - list_plans(limit?) / get_plan(plan_id)
     """
-    p = params or {}
+    p = _params(params)
 
     def _project_context(*, need_resolve: bool) -> Tuple[Optional[Any], Optional[Any], Optional[str], Optional[Dict[str, Any]]]:
         # An explicit analysis_root always wins — the evidence DB the caller
@@ -18503,6 +19101,71 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             include_audio=str(p.get("include_audio", p.get("includeAudio", True))).strip().lower() not in {"false", "0", "no", "none", "off"},
         )
 
+    if action == "generate_captions":
+        _r, proj, project_root, err = _project_context(need_resolve=False)
+        if err:
+            return err
+        from src.utils import captions as _captions_mod
+        from src.utils import strata as _strata_mod
+
+        conn, clip, clip_err = _strata_mod.resolve_clip(
+            project_root, p.get("clip_ref") or p.get("clipRef") or p.get("clip_id"), require_media=False
+        )
+        if clip_err:
+            return clip_err
+        _words = _strata_mod.read_words(conn, clip["clip_uuid"])
+        _opts = {}
+        for _key, _param in (
+            ("max_chars_per_line", "maxCharsPerLine"), ("max_lines", "maxLines"),
+            ("max_block_seconds", "maxBlockSeconds"), ("min_block_seconds", "minBlockSeconds"),
+            ("min_gap_seconds", "minGapSeconds"), ("pause_break_seconds", "pauseBreakSeconds"),
+        ):
+            _value = p.get(_key, p.get(_param))
+            if _value is not None:
+                _opts[_key] = int(_value) if _key in {"max_chars_per_line", "max_lines"} else float(_value)
+        try:
+            _result = _captions_mod.generate(
+                _words,
+                fmt=str(p.get("format") or p.get("fmt") or "srt").lower(),
+                with_chapters=str(p.get("with_chapters", p.get("withChapters", False))).strip().lower() in {"true", "1", "yes", "on"},
+                **_opts,
+            )
+        except _captions_mod.CaptionError as exc:
+            return _err(str(exc), code="CAPTION_PARAMS_INVALID", category="invalid_input")
+        _result["clip"] = {"clip_uuid": clip["clip_uuid"], "clip_name": clip.get("clip_name")}
+        return _result
+
+    if action == "plan_transcript_tighten":
+        _r, proj, project_root, err = _project_context(need_resolve=False)
+        if err:
+            return err
+        return _edit_engine_mod.plan_transcript_tighten(
+            project_root,
+            clip_ref=p.get("clip_ref") or p.get("clipRef") or p.get("clip_id"),
+            remove_fillers=str(p.get("remove_fillers", p.get("removeFillers", True))).strip().lower() not in {"false", "0", "no", "off"},
+            remove_false_starts=str(p.get("remove_false_starts", p.get("removeFalseStarts", True))).strip().lower() not in {"false", "0", "no", "off"},
+            collapse_pauses=str(p.get("collapse_pauses", p.get("collapsePauses", True))).strip().lower() not in {"false", "0", "no", "off"},
+            max_pause=float(p.get("max_pause", p.get("maxPause", _transcript_edit_defaults.DEFAULT_MAX_PAUSE_S))),
+            handle=float(p.get("handle", _transcript_edit_defaults.DEFAULT_HANDLE_S)),
+            min_cut=float(p.get("min_cut", p.get("minCut", _transcript_edit_defaults.DEFAULT_MIN_CUT_S))),
+        )
+
+    if action == "search_spoken_content":
+        _r, proj, project_root, err = _project_context(need_resolve=False)
+        if err:
+            return err
+        query = p.get("query") or p.get("q")
+        if not isinstance(query, str) or not query.strip():
+            return _err("query is required", code="MISSING_QUERY", category="invalid_input")
+        return _edit_engine_mod.search_spoken_content(
+            project_root,
+            query=query,
+            mode=str(p.get("mode") or "phrase"),
+            context_seconds=float(p.get("context_seconds", p.get("contextSeconds", 1.5))),
+            handle_seconds=float(p.get("handle_seconds", p.get("handleSeconds", 0.5))),
+            max_hits=int(p.get("max_hits", p.get("maxHits", 200))),
+        )
+
     if action == "plan_silence_ripple":
         _r, proj, project_root, err = _project_context(need_resolve=True)
         if err:
@@ -18516,7 +19179,14 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             items=items,
             timeline_name=tl.GetName(),
             timeline_fps=_edit_engine_timeline_fps(tl),
-            threshold_db=float(p.get("threshold_db") if p.get("threshold_db") is not None else p.get("thresholdDb") if p.get("thresholdDb") is not None else _edit_engine_mod.DEFAULT_SILENCE_THRESHOLD_DB),
+            # Omitted => None => the gate is calibrated per item from that
+            # slice's own dynamics. Passing the old fixed default here would
+            # make auto-calibration unreachable through the MCP surface.
+            threshold_db=(
+                float(_th)
+                if (_th := (p.get("threshold_db") if p.get("threshold_db") is not None else p.get("thresholdDb"))) is not None
+                else None
+            ),
             min_strip_frames=float(p.get("min_strip_frames") if p.get("min_strip_frames") is not None else p.get("minStripFrames") if p.get("minStripFrames") is not None else _edit_engine_mod.DEFAULT_SILENCE_MIN_STRIP_FRAMES),
             pre_head_frames=float(p.get("pre_head_frames") if p.get("pre_head_frames") is not None else p.get("preHeadFrames") if p.get("preHeadFrames") is not None else _edit_engine_mod.DEFAULT_SILENCE_PRE_HEAD_FRAMES),
             post_tail_frames=float(p.get("post_tail_frames") if p.get("post_tail_frames") is not None else p.get("postTailFrames") if p.get("postTailFrames") is not None else _edit_engine_mod.DEFAULT_SILENCE_POST_TAIL_FRAMES),
@@ -19095,6 +19765,9 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         "plan_tighten",
         "execute_tighten",
         "plan_silence_ripple",
+        "plan_transcript_tighten",
+        "generate_captions",
+        "search_spoken_content",
         "execute_silence_ripple",
         "plan_swap",
         "execute_swap",
@@ -19126,6 +19799,7 @@ _TIMELINE_ACTIONS = [
 
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline")
 def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Timeline operations: tracks, clips, import/export, generators, titles.
@@ -19311,7 +19985,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
     For long-form per-action guidance and a worked example, call:
       timeline(action="action_help", params={"name": "<action>"})
     """
-    p = params or {}
+    p = _params(params)
     # action_help is pull-on-demand metadata; no Resolve connection needed.
     if action == "action_help":
         return _action_help("timeline", p)
@@ -19712,7 +20386,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
             result["ignored_state_keys"] = ignored_state
         return result
     elif action == "extract_source_frame_ranges":
-        p = params or {}
+        p = _params(params)
         handles = int(p.get("handles", 24))
         gap_max = int(p.get("gap_max", 30))
         audio_ext = tuple(
@@ -19899,6 +20573,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline_markers")
 def timeline_markers(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
     """Markers and playhead operations on the current timeline.
@@ -19934,7 +20609,7 @@ def timeline_markers(action: str, params: Optional[Dict[str, Any]] = None) -> An
       export_review_report(scope?, include_capabilities?) -> {title, annotations, capabilities?}
       annotation_boundary_report(scope?) -> {capabilities, annotations}
     """
-    p = params or {}
+    p = _params(params)
     _, tl, err = _get_tl()
     if err:
         return err
@@ -20019,6 +20694,7 @@ def timeline_markers(action: str, params: Optional[Dict[str, Any]] = None) -> An
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline_ai")
 def timeline_ai(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """AI and analysis operations on the current timeline.
@@ -20032,7 +20708,7 @@ def timeline_ai(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       grab_still() -> {success}
       grab_all_stills(source?) -> {count}
     """
-    p = params or {}
+    p = _params(params)
     _, tl, err = _get_tl()
     if err:
         return err
@@ -20073,6 +20749,7 @@ def timeline_ai(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline_item")
 def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Properties, transforms, speed, keyframes, and metadata for a timeline item.
@@ -20124,7 +20801,7 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
 
     Default: track_type="video", track_index=1, item_index=0
     """
-    p = params or {}
+    p = _params(params)
     tl, item, err = _get_item(p)
     if err:
         return err
@@ -20312,6 +20989,7 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline_item_markers")
 def timeline_item_markers(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Markers, flags, and clip color on timeline items. Identify by track_type, track_index, item_index (item_index is 0-BASED: 0 = first clip; track_index is 1-based).
@@ -20334,7 +21012,7 @@ def timeline_item_markers(action: str, params: Optional[Dict[str, Any]] = None) 
 
     Default: track_type="video", track_index=1, item_index=0
     """
-    p = params or {}
+    p = _params(params)
     _, item, err = _get_item(p)
     if err:
         return err
@@ -20389,6 +21067,7 @@ def timeline_item_markers(action: str, params: Optional[Dict[str, Any]] = None) 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline_item_fusion")
 def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Fusion composition operations on timeline items. Identify by track_type, track_index, item_index (item_index is 0-BASED: 0 = first clip; track_index is 1-based).
@@ -20409,7 +21088,7 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
 
     Default: track_type="video", track_index=1, item_index=0
     """
-    p = params or {}
+    p = _params(params)
     _, item, err = _get_item(p)
     if err:
         return err
@@ -21690,6 +22369,7 @@ def _grade_evidence_base(proj, item, p: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline_item_color")
 def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Color grading, versions, LUTs, cache, and AI tools on timeline items. Identify by track_type, track_index, item_index (item_index is 0-BASED: 0 = first clip; track_index is 1-based).
@@ -21780,7 +22460,7 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
     For long-form per-action guidance and a worked example, call:
       timeline_item_color(action="action_help", params={"name": "<action>"})
     """
-    p = params or {}
+    p = _params(params)
     if action == "action_help":
         return _action_help("timeline_item_color", p)
     _, item, err = _get_item(p)
@@ -21895,6 +22575,7 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("timeline_item_takes")
 def timeline_item_takes(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Take management on timeline items. Identify by track_type, track_index, item_index (item_index is 0-BASED: 0 = first clip; track_index is 1-based).
@@ -21910,7 +22591,7 @@ def timeline_item_takes(action: str, params: Optional[Dict[str, Any]] = None) ->
 
     Default: track_type="video", track_index=1, item_index=0
     """
-    p = params or {}
+    p = _params(params)
     _, item, err = _get_item(p)
     if err:
         return err
@@ -21943,6 +22624,7 @@ def timeline_item_takes(action: str, params: Optional[Dict[str, Any]] = None) ->
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def gallery(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Gallery album management.
 
@@ -21958,7 +22640,7 @@ def gallery(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
     album_index is 0-based into the still albums list.
     """
-    p = params or {}
+    p = _params(params)
     _, proj, err = _check()
     if err:
         return err
@@ -22008,6 +22690,7 @@ def gallery(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def gallery_stills(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Manage stills in gallery albums (best results on Color page).
 
@@ -22028,7 +22711,7 @@ def gallery_stills(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
     File data is inlined in the response (DRX as text, images as base64).
     cleanup (default true) deletes exported files from disk after inlining.
     """
-    p = params or {}
+    p = _params(params)
     _, proj, err = _check()
     if err:
         return err
@@ -22161,6 +22844,7 @@ def gallery_stills(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 @_destructive_op("graph")
 def graph(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Node graph operations (color grading nodes). Source can be timeline, timeline item, or color group.
@@ -22200,7 +22884,7 @@ def graph(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     For long-form per-action guidance and a worked example, call:
       graph(action="action_help", params={"name": "<action>"})
     """
-    p = params or {}
+    p = _params(params)
     if action == "action_help":
         return _action_help("graph", p)
     source = p.get("source", "timeline")
@@ -22303,6 +22987,7 @@ def graph(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+@_guard_missing_params
 def color_group(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Manage color groups and their node graphs.
 
@@ -22314,7 +22999,7 @@ def color_group(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       get_pre_clip_graph(group_name) -> {available, num_nodes}
       get_post_clip_graph(group_name) -> {available, num_nodes}
     """
-    p = params or {}
+    p = _params(params)
     _, proj, err = _check()
     if err:
         return err
@@ -23225,6 +23910,7 @@ def _fusion_get_text_plus(comp, p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_guard_missing_params
 def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Fusion composition node graph operations.
 
@@ -23295,7 +23981,7 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       ColorCorrector, RectangleMask, EllipseMask, Tracker, MediaIn, MediaOut,
       Loader, Saver, Glow, FilmGrain, CornerPositioner, DeltaKeyer, UltraKeyer
     """
-    p = params or {}
+    p = _params(params)
 
     if action == "bulk_set_inputs":
         return _fusion_comp_bulk_set_inputs(p)
@@ -23795,6 +24481,7 @@ def _validate_glsl_minimal(source: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_guard_missing_params
 def fuse_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Author and install Fusion Fuse plugins (.fuse files).
 
@@ -23821,7 +24508,7 @@ def fuse_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
           docs/authoring/fuse-dctl-authoring.md for the per-kind option spec.
       list_templates() -> {kinds}
     """
-    p = params or {}
+    p = _params(params)
 
     if action == "path":
         return {"fuses_dir": _fuses_dir()}
@@ -24038,6 +24725,7 @@ _DCTL_VALID_CATEGORIES = ("lut", "aces_idt", "aces_odt")
 
 
 @mcp.tool()
+@_guard_missing_params
 def dctl(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Author and install DCTL files (Color page custom shaders + ACES transforms).
 
@@ -24074,7 +24762,7 @@ def dctl(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
           pass that as the `category` argument to install().
       list_templates() -> {kinds, kind_categories}
     """
-    p = params or {}
+    p = _params(params)
 
     def _category(default: str = "lut") -> Tuple[Optional[Dict[str, Any]], str]:
         cat = p.get("category", default)
@@ -24351,8 +25039,7 @@ def _execute_python_script(path: str, args: List[str],
 def _execute_lua_script(path: str) -> Dict[str, Any]:
     r = get_resolve()
     if r is None:
-        return _err("Cannot run Lua script — Resolve isn't running and "
-                    "auto-launch failed.")
+        return _not_connected_error()
     fusion = r.Fusion()
     if fusion is None:
         return _err("handle.Fusion() returned None — cannot run Lua scripts.")
@@ -24417,7 +25104,7 @@ def _run_inline_lua(source: str) -> Dict[str, Any]:
     """
     r = get_resolve()
     if r is None:
-        return _err("Cannot run Lua — Resolve isn't running and auto-launch failed.")
+        return _not_connected_error()
     fusion = r.Fusion()
     if fusion is None:
         return _err("handle.Fusion() returned None — cannot run inline Lua.")
@@ -24967,6 +25654,7 @@ def _extension_boundary_report(p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_guard_missing_params
 def script_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Author and install Resolve-page Lua/Python scripts (Workspace → Scripts menu).
 
@@ -25022,7 +25710,7 @@ def script_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
       refresh_or_restart_required(extension_type, category?) -> {refresh_luts, restart_required}
       extension_boundary_report(include_template_matrix?) -> {capabilities, template_matrix, dry_run_probes}
     """
-    p = params or {}
+    p = _params(params)
 
     if action == "extension_capabilities":
         return _extension_capabilities()
@@ -25526,5 +26214,5 @@ if __name__ == "__main__":
         logger.error(f"Unknown --transport {transport!r}; use stdio|sse|streamable-http")
         sys.exit(2)
 
-    logger.info(f"Starting DaVinci Resolve MCP Server (32 compound tools)")
+    logger.info("Starting DaVinci Resolve MCP Server (34 compound tools)")
     run_fastmcp_stdio(mcp)

@@ -2,6 +2,364 @@
 
 Release history for the DaVinci Resolve MCP Server. The latest release is summarized in the root README; older entries live here to keep the README focused.
 
+## What's New in v2.68.2
+
+Bug fixes. The server no longer opens a second DaVinci Resolve, and a failed
+connection now tells the caller what is actually wrong.
+
+### Fixed
+
+- **The server launched Resolve when one was already running — usually the wrong
+  one.** The free edition refuses external scripting by design, so on a machine
+  where only it is running `scriptapp("Resolve")` always returns None.
+  `get_resolve()` read that as *"Resolve is not running"* and ran `open` on the
+  application; with both editions installed that started **Studio**, a second and
+  different application, on every tool call.
+
+  `resolve_is_running()` now answers the question that was being assumed. It
+  returns None when it cannot tell, deliberately — "cannot tell" must never decay
+  into "nothing is running", because that is the answer that leads to launching
+  something. A genuinely absent Resolve is still launched, as documented, and the
+  macOS candidate list now contains **both** editions rather than only the
+  installer path.
+- **The error a caller received described something that had not happened.**
+  Eleven sites asserted that Resolve was not running, that starting it had been
+  tried and failed, and that the reader should check their Studio install. After
+  the fix above none of that was true, and the accurate guidance was only reaching
+  the log. `_not_connected_error()` derives the message from the situation and
+  names the applicable remedy — external scripting on Studio, or the in-app bridge
+  on the free edition, including the framework-Python prerequisite. Three codes:
+  `SCRIPTING_UNAVAILABLE`, `BRIDGE_UNAVAILABLE`, `RESOLVE_NOT_RUNNING`.
+- **Those two are marked `retryable: false`.** The `not_connected` category
+  defaults to retryable because auto-launch may succeed next time; neither of
+  these can — one needs a preference changed, the other a script started inside
+  Resolve — and reporting them as retryable sends an agent into a loop it cannot
+  win.
+- **The offline test suite opened Resolve, and connected to whatever was running.**
+  A stub-based audio test reached for `AUDIO_SYNC_*`, which are attributes on the
+  *live* object, so it called `get_resolve()`, found nothing, and started Resolve;
+  when Resolve *was* open it connected instead, making the test's result depend on
+  the state of the machine. `tests/conftest.py` closes both suite-wide and names
+  any launch attempt in the terminal summary.
+- **`src/server.py` reported the wrong tool count to every agent.** Its module
+  docstring said "34 compound tools" while the agent-facing workflow prompt and
+  the startup log line said 32. The drift guard only required the correct number
+  to appear *somewhere* in the file, so the wrong one shipped. It now rejects any
+  other count in front of that phrase, and counts decorators from the parsed
+  syntax tree rather than by matching text — a docstring mentioning
+  `@mcp.tool()` had been counted as a 35th tool.
+- **The bridge harness graded the wrong clip and reported a known trap as a
+  finding.** It took the first video item, which is often a generator or title
+  that has no MediaPoolItem and answers None to every node query, so the grading
+  surface read as unreachable; it now takes the first gradeable item. And it
+  passed the codec *description* `"H.264"` to `SetCurrentRenderFormatAndCodec`,
+  which only accepts the id `"H264"`, making that observation permanently false
+  for a documented reason.
+
+### Changed
+
+- `scripts/install_resolve_bridge.py` no longer claims Resolve ignores Fusion's
+  standalone script tree. Measured on free 21.0.3.7: markers left in two
+  undocumented container paths both appeared under Workspace ▸ Scripts, so Lite
+  scans more locations than the README documents. Install behaviour is unchanged —
+  the documented paths work, and each extra target is another chance for the macOS
+  App Management prompt to stall the copy — but the stated reason is now the true
+  one.
+
+### Validated
+
+Free edition alone (21.0.3.7, App Store), Studio never launched at any point,
+confirmed by process check after every stage: 165/165 read-shaped MCP actions
+clean with Blackmagic's module blocked; 109/112 API read methods exercised; render
+to a non-empty file with `set_format` true; AAF/DRT/EDL/FCPXML all written;
+SetLUT clears and reads back. Suite 1913 passing.
+
+## What's New in v2.68.1
+
+Bug fix. A missing tool argument now returns the structured error envelope the
+rest of the surface uses, instead of escaping as a raw `KeyError`.
+
+### Fixed
+
+- **A missing argument reached the client as an unroutable crash.** Actions read
+  `p["track_type"]` directly; when the key was absent the resulting `KeyError`
+  escaped the action, escaped the tool, and arrived as
+  `ToolError: Error executing tool timeline: 'track_type'` — no code, no
+  category, no remediation. Walking the whole surface found **99 of 512 declared
+  actions** failing this way across 16 tools (`timeline`, `graph`, `render`,
+  `media_pool`, `media_storage`, `fusion_comp`, `folder`, `gallery_stills`,
+  `layout_presets`, `project_settings`, `project_manager_*`, `render_presets`,
+  `resolve_control`, `timeline_markers`). They now return, for example:
+
+      {"error": {"message": "'track_type' is required",
+                 "code": "MISSING_TRACK_TYPE", "category": "invalid_input",
+                 "retryable": false, "remediation": "...", "state": {...}}}
+
+  `retryable: false` matters as much as the code: an input error the caller must
+  fix was previously reported through a path that defaulted to retryable, which
+  sends an agent into a loop it cannot win.
+
+  The mechanism is a params dict whose missing keys raise a dedicated
+  `KeyError` subclass, caught at the tool boundary. Catching plain `KeyError`
+  there would have been simpler and wrong — it cannot tell a missing argument
+  from an internal lookup failure on some other dict, so our own bugs would have
+  been relabelled as the caller's mistake. `contracts.validate` remains the
+  preferred tool where a type, range or enum also needs checking, and the actions
+  already using it are unchanged.
+
+### Added
+
+- `tests/test_tool_argument_validation.py` walks **every declared action** with an
+  empty params dict and asserts none leaks a `KeyError`. Reading the source cannot
+  find this class — `p[...]` after a guard is correct and `p[...]` without one is a
+  bug — so the walk executes each branch against a stub Resolve. It fails on the
+  pre-fix tree and runs in 2 s.
+
+### Changed
+
+- `test_doc_tool_counts` counts `@mcp.tool()` decorators from the parsed syntax
+  tree rather than by matching the text. A docstring explaining where the
+  decorator has to sit was counted as a 35th tool; prose that mentions a
+  decorator is not a tool.
+
+## What's New in v2.68.0
+
+Six engines that let an agent judge its own output before shipping it — audio
+loudness, silence calibration, image QC, transcript editing, captions — plus the
+**in-app bridge**, which reaches the **free edition** of DaVinci Resolve, whose
+external scripting API refuses foreign processes entirely.
+
+### Added
+
+- **Audio delivery QC.** Delivery targets carry a named loudness contract
+  (`web`, `podcast`, `ebu_r128`, `atsc_a85`, `ott_dialogue_gated`) and project it
+  into the existing `loudness_qc` vocabulary. Dialogue-gated standards emit no
+  gradeable `integrated` figure — `loudness_qc` measures full-program, so grading
+  a dialogue-gated number against it produces a verdict that means nothing; it
+  travels as advisory metadata with the reason stated. No shipped target names a
+  standard, because a ProRes master has no inherent programme loudness.
+  `render(action='list_loudness_standards')`.
+- **Auto-calibrated silence gate.** `plan_silence_ripple` derives the threshold
+  from each clip's own dynamics instead of a fixed −30 dB. The metric is `astats`
+  **RMS trough** paired with RMS peak: `mean_volume` tracks programme level, and
+  `Noise floor dB` moved 19 dB between two fixtures sharing an identical noise
+  bed purely because one was quieter for longer. Against ground truth the fixed
+  threshold was wrong on all four fixtures. When calibration cannot be trusted
+  the item is **kept whole** rather than stripped — a fixed threshold applied to
+  material it does not suit is not a degraded answer, it is a wrong one.
+- **Image QC.** `media_analysis(action='assess_grade')` gives an agent
+  deterministic grounds to reject its own grade: tonal frame, noise
+  amplification, banding, highlight posterization and clipping growth, with
+  validated **CIEDE2000** (all 33 Sharma/Wu/Dalal reference pairs to 4 dp). A
+  clean grade costs zero tokens; vision is spent only where the numbers cannot
+  settle it. Non-display-referred working spaces are **refused, never guessed** —
+  the right transform depends on camera and project colour management, which a
+  frame cannot tell you.
+- **Word-level transcript editing.** `edit_engine(action='plan_transcript_tighten')`
+  removes fillers, false starts and over-long pauses at word boundaries with a
+  reason per cut, and `search_spoken_content` searches word timings across a
+  whole shoot to build selects. A lexical axis alongside `find_similar`'s
+  semantic-visual one.
+- **Captions.** `media_analysis(action='generate_captions')` emits SRT and WebVTT
+  under broadcast line rules, plus chapters and YouTube description text.
+- **The in-app bridge — live read and write control of the FREE edition.**
+  Opt-in with `DAVINCI_RESOLVE_BRIDGE=1`; unset changes nothing for existing
+  installs. A script launched from Workspace ▸ Scripts is handed the live
+  `resolve` object on any edition and re-exports it over an authenticated
+  loopback listener, which `connect_resolve` uses as a third transport beside
+  Local and Network. Existing call sites need no changes. This is the documented
+  in-app path, not a licence circumvention — but Blackmagic could close it, so
+  treat it as supported-until-it-is-not.
+- **`shutdown` and `reload` for the bridge.** The launcher blocks (correctly — a
+  Scripts-menu script is a child process, so a daemon thread dies the instant it
+  returns), which used to mean a stale in-Resolve copy could only be replaced by
+  quitting Resolve. `reload` re-imports the runtime from disk in place, and
+  refuses before stopping if the new sources will not compile.
+
+### Fixed
+
+- **The bridge was unreachable on the machine it exists for.** `_try_connect`
+  returned on `dvr_script is None` before calling `connect_resolve`, the function
+  that accepts None in bridge mode. Blackmagic's scripting module ships with the
+  *installer*, not the App Store build, so a free-edition-only machine has no
+  `Developer/Scripting/Modules` tree and the import fails. Verified by blocking
+  the import against a healthy live bridge: `get_resolve()` answered None.
+- **Auto-launch started the wrong Resolve, or one nobody asked for.** The macOS
+  path list contained only the installer location, so a free-only machine found
+  nothing and a machine with both always started Studio. In bridge mode it now
+  refuses outright: launching cannot create a listener that only a Scripts-menu
+  run creates.
+- **Interchange export over the bridge was degrading silently.** Resolve's API
+  constants (`EXPORT_AAF`, `AUDIO_SYNC_*`) are plain attributes and `dir()` does
+  not list them — measured on 21.0.3.7, `dir(resolve)` returns 34 names with no
+  `EXPORT_*` among them while the constants read back as real values. The proxy
+  could only call methods, so `hasattr` said False and the server fell through to
+  handing Resolve the bare string `"EXPORT_AAF"`.
+- **The proxy broke every chain longer than one call.** Every live Resolve object
+  reports `type(obj).__name__ == "PyRemoteObject"` — root 34 methods, Project 49,
+  TimelineItem 88, one class name — so caching method sets on it let the first
+  object touched define `hasattr` for everything after. Method sets are now keyed
+  on provenance, and absence is re-verified against the object itself.
+- **Bridge error codes never crossed the transport.** Every surface code was
+  flattened to `operation_failed`, so `stale_handle` (re-fetch) and
+  `ambiguous_locator` (disambiguate) arrived as one undifferentiated failure.
+
+### Validated live
+
+On **DaVinci Resolve 21.0.3.7 (App Store, free, sandboxed)**, with Blackmagic's
+scripting module blocked to reproduce a free-only machine: 34 tools, 583 declared
+actions, **165 read-shaped actions attempted, 145 clean, zero bridge-attributable
+failures**; 109 of the 112 API read methods the tools actually call exercised on
+the live object graph; a render completed to a non-empty file; AAF/DRT/EDL/FCPXML
+all written by `Timeline.Export`; 400 clips appended in 1.23 s and enumerated at
+0.81 ms/item; an evicted handle refusing with `stale_handle` rather than
+resolving to another object; and reads *and* writes continuing to work with a
+native file dialog open, because the bridge runs in its own process.
+
+`scripts/bridge_differential.py --mode differential` diffs the bridge against
+native scripting on one Studio instance. That comparison has **not** been run
+yet, so the evidenced claim is that the bridge carries the surface the tools use
+on the free edition — not that it is byte-identical to native scripting.
+
+## What's New in v2.67.1
+
+Documentation correction. No code changes — v2.67.0 already ships the correct
+behavior.
+
+### Changed
+
+- **`docs/kernels/render-deliver-kernel.md` no longer quotes a format/codec count
+  as portable.** It presented "23 formats and 99 format/codec pairs" as the
+  expected probe result; a live probe on Studio 19.1.3.7 found 20 formats and 271
+  pairs. Both mentions now carry the build they came from and point at probing
+  the machine in hand (`probe_render_matrix`, or `list_delivery_targets` with
+  `check_availability`) instead of comparing against a fixed number.
+- The kernel's boundary list now records the two traps the delivery-target work
+  verified live: codec **descriptions are not codec ids** (`H.264` vs `H264`, not
+  only the ProRes family), and some formats expose **no codecs at all** (`Wave`,
+  `GIF` on 19.1.3.7) and cannot be selected through this API.
+
+## What's New in v2.67.0
+
+Adds **delivery targets** — named render intents that carry their own QC spec —
+and fixes a silent render-codec bug found while designing them.
+
+### Fixed
+
+- **Render codec display names were rejected.** `GetRenderCodecs` returns
+  `{description: id}`, but the codec was passed to
+  `SetCurrentRenderFormatAndCodec`, `GetRenderResolutions`, and
+  `prepare_render_job` **raw** while the format was normalized. Verified live on
+  Studio 19.1.3.7: `('mov', 'Apple ProRes 422 HQ')` returns False while
+  `('mov', 'ProRes422HQ')` returns True — and the same holds for
+  `('mp4', 'H.264')` vs `('mp4', 'H264')`. Any render set by the codec name shown
+  in the Deliver page failed, across every codec family. This is the codec half
+  of the format-id fix (issue #59).
+- **A rejected format/codec no longer queues a job anyway.**
+  `prepare_render_job` previously applied settings and called `AddRenderJob()`
+  even when `SetCurrentRenderFormatAndCodec` returned False, reporting
+  `success: True` with `format_success: False` buried in the payload — a queued
+  job that would render in the *previously set* codec. It now returns
+  `RENDER_FORMAT_CODEC_REJECTED` with the machine's available codecs and queues
+  nothing. `set_format_and_codec` returns the same structured error instead of a
+  bare `success: False`.
+- **The granular server never received the issue #59 fix.**
+  `get_render_codecs` passed a raw display name, and
+  `set_current_render_format_and_codec` passed both format and codec raw. The
+  resolvers now live in `src/utils/render_ids.py` and are shared by both servers,
+  so the two cannot drift apart again.
+
+### Added
+
+- **Delivery targets** (`src/utils/delivery_targets.py`) — 28 named render
+  intents across master / web / sequence / broadcast / package tiers, every one
+  resolved live against Resolve Studio 19.1.3.7 (20 formats / 271 pairs). One
+  definition projects onto both Resolve `SetRenderSettings` keys and the
+  ffprobe-shaped spec `deliverable_qc` consumes, so a render and the check that
+  verifies it come from the same source. New `render` actions:
+  `list_delivery_targets`, `resolve_delivery_target`, `prepare_delivery_job`.
+  - Ids describe the deliverable (`prores422hq_master`, `h264_1080p_web`);
+    platform names (`youtube`, `tiktok`, `avid`, `stems`) are **aliases**, so a
+    platform changing its guidance repoints an alias instead of rewriting a target.
+  - Format and codec are ordered **candidate lists** resolved against the live
+    matrix, because codec descriptions vary by Resolve version, license, and
+    installed IO plugins. An unavailable target fails with the machine's actual
+    available lists; `list_delivery_targets` with `check_availability` reports
+    what this install can render.
+  - User-defined targets load from `logs/delivery-targets.json` (override with
+    `DAVINCI_RESOLVE_MCP_DELIVERY_TARGETS`); a malformed entry is skipped with a
+    warning rather than taking out the shipped set.
+- **`deliverable(action="spec_from_authored")`** on the advanced server —
+  projects the authored deliverable vocabulary (codec display names,
+  `"1920x1080"`, `"-16 LUFS"`, `<SHOW>_<EP>_<YYYYMMDD>.mov` naming templates)
+  onto a `deliverable_qc` spec plus a `loudness_qc` target. Anything it cannot
+  map is reported in `unmapped[]` rather than dropped.
+- **The `deliver` apply contract now carries QC specs.**
+  `APPLY_CONTRACT.deliver` emits `qc[]` alongside each deliverable, so a render
+  job travels with the spec that will verify it. Previously a stub.
+- **`tests.test_duplicate_definitions`** — static guard against a module-level
+  name being defined twice under `src/`. pyflakes does not catch this (it only
+  reports redefinition of an *unused* name), and the dangerous case is exactly
+  the one it misses. Added to the release validation set.
+
+### Notes
+
+- Bitrate is deliberately not encoded in delivery targets: Resolve exposes no
+  bitrate render-setting key, only `VideoQuality`, whose type varies per codec.
+- Image-sequence and package (IMF/DCP) targets return no QC spec —
+  `deliverable_qc` probes a single file, and those render many files or a
+  directory. Every such target carries an explicit `qc_skip_reason`, so a missing
+  check is always explained rather than silent.
+- **There is no audio-only WAV target.** The `Wave` format exposes zero codecs
+  and `SetCurrentRenderFormatAndCodec('wav', …)` rejects every value tried,
+  including the empty string. Recorded in `src/utils/api_truth.py` and the
+  generated `docs/reference/api-limitations.md`.
+- The live pass corrected candidate spellings that were wrong: plain
+  `"DNxHR HQX"` / `"DNxHR 444"` do not exist (live labels carry a bit depth),
+  DPX/TIFF codecs are `"RGB 10 bits"` not `"RGB 10-bit"`, and PNG is not a
+  Resolve render format.
+- `container` is `"mov"` for both `.mov` and `.mp4`: ffprobe reports
+  `format_name=mov,mp4,m4a,3gp,3g2,mj2` for each and only the first token is
+  kept, so `video.codec` is what discriminates them.
+
+## What's New in v2.66.0
+
+Generalizes the HTTP transcription backend introduced in v2.65.0 into a
+configuration-driven registry, so additional local, network, or cloud-backed
+adapters no longer require MCP source changes. Contributed in PR #97 by
+@double2tea.
+
+### Changed
+
+- **Pluggable HTTP transcription providers** (PR #97, @double2tea) — the
+  MLX-specific router backend is replaced by an ordered registry of HTTP
+  transcription providers registered via
+  `DAVINCI_RESOLVE_MCP_TRANSCRIPTION_HTTP_PROVIDERS` (a JSON array). Each entry
+  requires `id` and `base_url`; optional adapter fields cover `label`, `model`,
+  `health_path`, `transcribe_path`, `health_field`, `health_value`, `headers`,
+  `request_body`, `field_map`, and `response_field`. Configured providers are
+  selected as stable `http:<id>` backend names and preferred in transcription
+  capability ordering. Auth headers are sent on health and transcription
+  requests but kept out of capability reports, and malformed configuration
+  fails fast. Response handling now accepts a transcript object, a JSON-encoded
+  transcript string, or plain text under the configured `response_field`.
+  Audiobox is documented as one adapter example rather than a core requirement.
+
+### Removed
+
+- The `DAVINCI_RESOLVE_MCP_MLX_AUDIO_URL` / `DAVINCI_RESOLVE_MCP_MLX_AUDIO_MODEL`
+  environment variables added in v2.65.0 are superseded by the generic provider
+  registry above. To keep an Audiobox/MLX router, register it as a provider:
+  `[{"id":"audiobox-local","base_url":"http://127.0.0.1:8000","request_body":{"provider":"mlx"}}]`.
+
+### Validation
+
+- `tests/test_media_analysis.py` and the analysis caps/runs/store suites pass
+  (153 on the merged tree); static checks and drift guards pass.
+- No DaVinci Resolve scripting behavior changed: the change is confined to the
+  stdlib HTTP transcription path and is gated behind an env var. Live Resolve
+  validation not required.
+
 ## What's New in v2.65.0
 
 Bundles two community contributions from @double2tea: an optional HTTP
